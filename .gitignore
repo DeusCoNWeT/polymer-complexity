@@ -7,4 +7,7 @@ config.json
 pbower
 pbower_recursivo
 test_component
-
+version.txt
+version2.txt
+doc
+out

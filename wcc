@@ -2,18 +2,11 @@
 
 // DEPENDENCIES
 var program = require('commander');
-var jsdom = require('jsdom');
-var fs = require('fs');
-var jquery = require("jquery");
-var Promise = require('promise');
-var plato = require('plato');
-var http = require('http');
-var https = require('https');
-var connect = require('connect');
-var serveStatic = require('serve-static');
-var analyzeCss = require('analyze-css');
+var utils = require('./src/Utils');
+var report = require('./src/Report');
+var mixpanel_report = require('./src/Mixpanel_report');
 var async = require('async');
-var Mixpanel = require('mixpanel');
+var fs = require("fs");
 // STATIC FOLDER
 var TMP_FOLDER = '.tmp_plato/';
 
@@ -41,314 +34,8 @@ program.output = program.output || 'results';
 if (program.config) {
   var config = fs.readFileSync(program.config, 'utf-8');
   program.config = JSON.parse(config);
-  if (program.config.mixpanel && !program.nomixpanel) {
-    if (program.config.mixpanel.complexity) {
-      var mixpanel_complexity = Mixpanel.init(program.config.mixpanel.complexity);
-    }
-    if (program.config.mixpanel.maintainability) {
-      var mixpanel_maintainability = Mixpanel.init(program.config.mixpanel.maintainability)
-    }
-  }
-}
-// Auxiliar functions
-
-/**
- * getCurrentDir - Get folder from a file path
- *
- * @param  {String} file File path
- * @return {String}      Folder path of the file
- */
-function getCurrentDir(file) {
-  var split = file.split('/');
-  split.length = split.length - 1;
-  return split.join('/') + '/';
 }
 
-
-/**
- * removeDotDot - Remove .. between folders.
- *
- * @param  {type} url Path with .. references
- * @return {type}     Path without .. references
- */
-function removeDotDot(url) {
-  var realUrl = [];
-  var splited = url.split('/');
-  for (var i = 0; i < splited.length; i++) {
-    if (splited[i] === '..' && realUrl.length > 0) {
-      realUrl.length = realUrl.length - 1;
-    } else {
-      realUrl.push(splited[i]);
-    }
-  }
-  return realUrl.join('/');
-}
-
-/**
- * getScriptFromUrl - Get a script from external resource (CDN)
- *
- * @param  {String} url Script URL
- * @return {Promise}    Resolve: [{file:url_of_file, script:script_contained_in_file}]
- *                      Reject: Response received of GET to url
- */
-function getScriptFromUrl(url) {
-  return new Promise(function (resolve, reject) {
-    var script = "";
-    var protocol = url.match(/^https/) ? https : http;
-    var request = protocol.get(url, function (response) {
-      if (response.statusCode !== 200) {
-        reject(response);
-      } else {
-        response.setEncoding('utf8');
-        response.on('data', function (chunk) {
-          script += chunk;
-        });
-        response.on('end', function () {
-          resolve([{
-            file: url,
-            script: script
-          }]);
-        });
-      }
-    });
-  });
-}
-
-/**
- * getScriptFromScript - description
- *
- * @param  {String} file Script path
- * @return {Promise}    Resolve: [{file:path_to_file, script:script_contained_in_file}]
- *                      Reject: ReadFile error
- */
-function getScriptFromScript(file) {
-  return new Promise(function (resolve, reject) {
-    file = removeDotDot(file);
-    fs.readFile(file, function (err, script) {
-      if (err) {
-        console.log(err);
-        reject(err);
-      } else {
-        resolve([{
-          file: file,
-          script: script
-        }]);
-      }
-    });
-  });
-}
-
-
-/**
- * getScripts - Get all scripts from path. If recursive is true, get all script from link and script tags
- *
- * @param  {type} file      Path to principal file
- * @param  {type} recursive If true, look for scripts in the dependencies of the principal file.
- * @return {Promise}        Resolve: [{file:parth_to_file, script:script_contained_in_file}]
- *                          Reject: if exist error to open the file
- */
-function getScripts(file, recursive) {
-  file = removeDotDot(file);
-  var html = fs.readFileSync(file, "utf-8");
-  var current_dir = getCurrentDir(file);
-
-  return new Promise(function (resolve, reject) {
-    jsdom.env(html, function (err, window) {
-      if (err) {
-        reject(err);
-        return;
-      }
-      var $ = jquery(window);
-      var $script = "";
-      var $imports = $('link[rel="import"]');
-      var promises = [];
-      // get scripts
-      $('script').each(function (index) {
-        // script element
-        var $el = $(this);
-        // script source if exist
-        var src = $el.attr('src');
-        // if its a local file, folder
-        var file_dir;
-        if (src) {
-          if (recursive) {
-            if (src.match(/^https?/)) {
-              promises.push(getScriptFromUrl(src));
-            } else {
-              file_dir = current_dir + src;
-              promises.push(getScriptFromScript(file_dir));
-            }
-          }
-        } else { // is a explicit script
-          $script = $script + $el.html() + '\n';
-        }
-      });
-      // get imports
-      if ($imports && recursive) {
-        $imports.each(function (index) {
-          var file_dir = current_dir + $(this).attr('href');
-          promises.push(getScripts(file_dir, recursive));
-        });
-      }
-      if (promises.length > 0) {
-        Promise.all(promises).then(function (values) {
-          var reduced = values.reduce(function (a, b) {
-            return a.concat(b);
-          });
-          var current = {
-            file: file,
-            script: $script
-          };
-          reduced.push(current);
-          resolve(reduced);
-        });
-      } else {
-        resolve([{
-          file: file,
-          script: $script
-        }]);
-      }
-    });
-  });
-}
-
-/**
- * removeRepeted - Remove repeted element from a list with {file:file_path,script:script_text}
- *
- * @param  {Array} list List with repeted elements
- * @return {type}      List without repeted elements
- */
-function removeRepeted(list) {
-  var repeted = [];
-  var i = 0;
-  while (i < list.length) {
-    if (repeted.indexOf(list[i].file) == -1) {
-      repeted.push(list[i].file);
-      i++;
-    } else {
-      list.splice(i, 1);
-    }
-  }
-  return list;
-}
-
-
-/**
- * deleteFolderRecursive - Remove a folder and all file contened inside.
- *
- * @param  {Script} path Path to folder
- */
-function deleteFolderRecursive(path) {
-  if (fs.existsSync(path)) {
-    fs.readdirSync(path).forEach(function (file, index) {
-      var curPath = path + "/" + file;
-      if (fs.lstatSync(curPath).isDirectory()) { // recurse
-        deleteFolderRecursive(curPath);
-      } else { // delete file
-        fs.unlinkSync(curPath);
-      }
-    });
-    fs.rmdirSync(path);
-  }
-}
-
-/**
- * createTmp - Create a temporal folder. If exist, override it.
- *
- * @return {Folder}  Folder direction.
- */
-function createTmp(folder) {
-  if (fs.existsSync(folder)) {
-    deleteFolderRecursive(folder);
-  }
-  fs.mkdirSync(folder);
-}
-
-/**
- * createFiles - Create temporal files to be read by plato.
- *
- * @param  {Array} files Array with files and script text {file:file,  script:script_text}
- * @param  {Array} folder Temportal folder to store files
- */
-function createFiles(files, folder) {
-  var new_dir = [];
-  if (folder[folder.length - 1] !== '/') folder += '/';
-
-  function errFn(err, file) {
-    if (err) {
-      console.log(err);
-      return;
-    }
-  }
-  for (var i = 0; i < files.length; i++) {
-    var file_name = files[i].file.replace('./', '');
-    file_name = file_name.replace(/\//g, '_');
-    file_name = file_name.replace(/\.html$/g, '.js');
-    var filepath = folder + file_name;
-    new_dir.push(filepath);
-    console.log('Created file: ', filepath);
-    var fd = fs.openSync(filepath, 'w');
-    fs.write(fd, files[i].script, null, 'utf8', errFn);
-  }
-  return new_dir;
-}
-
-function generateJSreport(files_dir, output, options) {
-  return function (cb) {
-    plato.inspect(files_dir, output, options || {}, function (results) {
-      console.log('Generated JS report');
-      cb(null, results);
-    });
-  };
-}
-
-function generateCSSReport(file, options) {
-  file = removeDotDot(file);
-  var html = fs.readFileSync(file, "utf-8");
-  // remove comments
-  html = html.replace(/<!--(?!>)[\S\s]*?-->/g, '');
-  // Remove @appss no supported)
-  html = html.replace(/(@apply[^\)]*\)\;?)/g, "/*$1*/");
-
-  return function (cb) {
-    var css = "";
-    var re = /<style[^>]*>([\w\W]*?)<\/style>/gm;
-    var match;
-
-    while ((match = re.exec(html)) !== null) {
-      if (match.length > 1) {
-        css += match[1] + '\n';
-      }
-    }
-    new analyzeCss(css, options, function (err, results) {
-      if (!err) {
-        console.log('Generated CSS report');
-      }
-      cb(err, results);
-    });
-  };
-}
-
-
-/*
-  Send to mixpanel
-*/
-function sendMixpanel(name, report) {
-  if (!program.nomixpanel) {
-    // send maintainability
-    var maintainability = {
-      component: name,
-      maintainability: report.js[0].complexity.maintainability
-    };
-    mixpanel_maintainability.track(name, maintainability);
-    // send complexity
-    var complexity = {
-      component: name,
-      complexity: report.js[0].complexity.methodAverage.cyclomatic
-    };
-    mixpanel_complexity.track(name, complexity);
-  }
-}
 
 
 // MAIN
@@ -365,81 +52,43 @@ if (program.config) {
   // if base_folder is set, check if last char is folder delimiter
   if (base_folder && base_folder.slice(-1) !== "/") base_folder += "/";
 
-  var promises = [];
-  createTmp(TMP_FOLDER);
-  components.forEach(function (component) {
-    var promise = new Promise(function (resolve, reject) {
+
+  var promises = components.map(function (component) {
+    return new Promise(function (resolve, reject) {
       var folder = base_folder + component;
-      getScripts(folder, program.recursive).then(function (results) {
-        removeRepeted(results);
-        // avoid collisions
-        var tmp_folder = TMP_FOLDER + Math.random().toString().replace('.', '');
-        createTmp(tmp_folder);
-        var files_dir = createFiles(results, tmp_folder);
-        var output = program.output + '/' + component.replace('.html', '');
-        var parallel = [generateJSreport(files_dir, output, {}), generateCSSReport(folder, {})];
-        async.parallel(parallel, function (err, result) {
-          if (err) {
-            reject(err);
-          } else {
-            var report = {};
-            report[component] = {
-              js: result[0],
-              css: result[1]
-            };
-            resolve(report);
-          }
-        });
-      });
+      report.analyze(folder).then(function (result) {
+        var report = {};
+        report[component] = result;
+        resolve(report);
+      }, reject);
     });
-    promises.push(promise);
   });
 
   Promise.all(promises).then(function (final_report) {
-    deleteFolderRecursive(TMP_FOLDER);
-    createFiles([{
-      file: 'complexityReport.json',
-      script: JSON.stringify(final_report, null, 2)
-    }], program.output);
-    console.log('\n');
+    report.cleanFolders();
+    console.log("Generating reports...\n");
+    report.generateReport(final_report, program.output);
     console.log('RESULT:')
+
     final_report.forEach(function (report) {
       for (var name in report) {
         if (report.hasOwnProperty(name)) {
-          sendMixpanel(name, report[name]);
-          console.log('+\x1b[33m ' +name + ':\x1b[0m');
+          if (!program.nomixpanel) mixpanel_report.sendMixpanel(name, report[name], program.mixpanel_report);
+          console.log('+\x1b[33m ' + name + ':\x1b[0m');
           console.log('\t*\x1b[36m maintainability: \x1b[1;36m' + report[name].js[0].complexity.maintainability + '\x1b[0m');
           console.log('\t*\x1b[36m complexity: \x1b[1;36m' + report[name].js[0].complexity.methodAverage.cyclomatic + '\x1b[0m');
         }
       }
     });
-    if(!program.nomixpanel) console.log('\nRegistered on mixpanel');
+    if (!program.nomixpanel) console.log('\nRegistered on mixpanel');
   }, function (err) {
     console.log(err);
   });
 
 
 } else {
-  getScripts(program.component, program.recursive).then(function (results) {
-    removeRepeted(results);
-    createTmp(TMP_FOLDER);
-    var files_dir = createFiles(results, TMP_FOLDER);
-    var parallel = [generateJSreport(files_dir, program.output, {}), generateCSSReport(program.component, {})];
-    async.parallel(parallel, function (err, results) {
-      deleteFolderRecursive(TMP_FOLDER);
-      if (err) {
-        return console.log(err);
-      }
-      var report = {
-        js: results[0],
-        css: results[1]
-      };
-      createFiles([{
-        file: 'complexityReport.json',
-        script: JSON.stringify(report, null, 2)
-      }], program.output);
-    });
-
+  report.analyze(program.component, program).then(function (report) {
+    report.generateReport(report, program.output);
   }, function (err) {
     console.log('It couldn\'t read all the files');
   });
